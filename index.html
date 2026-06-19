@@ -6,6 +6,127 @@
     <title>Restaurant Association - Full Email Analytics Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script>
+    // ===== GOOGLE SHEETS CONFIG =====
+    const SHEET_ID = '1cCDQWBuPU7bcq_690xhB2xHxRSvEGDyZ0f2S9cONS_8';
+    const SHEETS = { tag_emails:'tag_emails', newsletter:'newsletter', forms:'forms', contacts:'contacts' };
+    function sheetCSVUrl(tabName) {
+        return `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tabName)}`;
+    }
+    const REFRESH_MS = 2 * 60 * 60 * 1000;
+
+    let gTagEmails=[], gNewsletter=[], gForms=[], gContacts=[];
+    let dataLoaded=false, lastRefresh=null;
+
+    // Splits raw CSV text into rows, respecting quoted fields that may contain
+    // embedded commas or newlines (Google Sheets CSV export can produce these).
+    function splitCSVRows(text) {
+        const rows=[]; let row=[]; let cur=''; let inQ=false;
+        for(let i=0;i<text.length;i++){
+            const c=text[i];
+            if(c==='"'){
+                if(inQ && text[i+1]==='"'){ cur+='"'; i++; continue; }
+                inQ=!inQ; continue;
+            }
+            if(c===','&&!inQ){ row.push(cur); cur=''; continue; }
+            if((c==='\n'||c==='\r')&&!inQ){
+                if(c==='\r'&&text[i+1]==='\n') i++;
+                row.push(cur); cur='';
+                if(row.length>1||row[0]!=='') rows.push(row);
+                row=[]; continue;
+            }
+            cur+=c;
+        }
+        if(cur!==''||row.length){ row.push(cur); rows.push(row); }
+        return rows;
+    }
+    function parseSheetCSV(text) {
+        const rows=splitCSVRows(text.trim());
+        if(rows.length<2)return[];
+        const headers=rows[0].map(h=>h.trim());
+        return rows.slice(1).map(vals=>{
+            const obj={};
+            headers.forEach((h,i)=>obj[h]=(vals[i]||'').trim());
+            return obj;
+        }).filter(r=>Object.values(r).some(v=>v));
+    }
+    async function fetchSheet(tabName) {
+        const res=await fetch(sheetCSVUrl(tabName));
+        if(!res.ok)throw new Error('Failed: '+tabName);
+        return parseSheetCSV(await res.text());
+    }
+    async function loadAllData() {
+        showLoadingBanner('Loading data from Google Sheets...');
+        try {
+            const [te,nl,fm,ct]=await Promise.all([
+                fetchSheet(SHEETS.tag_emails), fetchSheet(SHEETS.newsletter),
+                fetchSheet(SHEETS.forms), fetchSheet(SHEETS.contacts)
+            ]);
+            gTagEmails=te; gNewsletter=nl; gForms=fm; gContacts=ct;
+            dataLoaded=true; lastRefresh=new Date();
+            rebuildCoreData();
+            updateRefreshBadge(); hideLoadingBanner(); refreshCurrentPage();
+        } catch(e) {
+            hideLoadingBanner();
+            showErrorBanner('Data load failed. Check Sheet is public.');
+            console.error(e);
+        }
+    }
+    function refreshCurrentPage() {
+        const active=document.querySelector('[id^="page-"].visible');
+        if(!active)return; const pid=active.id;
+        if(pid==='page-home')renderHome();
+        if(pid==='page-signup'){renderSignupKPIs();drawDonut2();renderRecipients();renderOrgs();}
+        if(pid==='page-nurturing')renderNurturing();
+        if(pid==='page-category'&&currentCategory)showCategory(currentCategory);
+        if(pid==='page-eventoccur'&&currentEOName)showEventOccur(currentEOName,currentEOTag,currentEOColor);
+        if(pid==='page-registration'&&currentRegName)showRegistration(currentRegName);
+        if(pid==='page-newsletter')renderNewsletter();
+    }
+    function showLoadingBanner(msg){
+        let b=document.getElementById('_loadBanner');
+        if(!b){b=document.createElement('div');b.id='_loadBanner';
+        b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;background:#1e40af;color:#fff;text-align:center;font-size:12px;padding:6px;font-weight:600;';
+        document.body.appendChild(b);}
+        b.textContent=msg;b.style.display='block';
+    }
+    function hideLoadingBanner(){const b=document.getElementById('_loadBanner');if(b)b.style.display='none';}
+    function showErrorBanner(msg){
+        let b=document.getElementById('_errBanner');
+        if(!b){b=document.createElement('div');b.id='_errBanner';
+        b.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;background:#991b1b;color:#fff;text-align:center;font-size:12px;padding:6px;font-weight:600;cursor:pointer;';
+        b.onclick=()=>b.style.display='none';document.body.appendChild(b);}
+        b.textContent=msg+' (click to dismiss)';b.style.display='block';
+    }
+    function updateRefreshBadge(){
+        const el=document.getElementById('lastRefreshTime');
+        if(el&&lastRefresh)el.textContent='Updated: '+lastRefresh.toLocaleTimeString();
+    }
+    function rowStats(rows){
+        const sent=rows.length;
+        // NOTE: the "Read" column in the sheet is always "Yes" (it just means the email
+        // was queued/triggered to be tracked) — it does NOT mean the recipient opened it.
+        // The real "opened" signal is whether "Date read" has a value.
+        const opened=rows.filter(r=>(r['Date read']||'').trim()!=='').length;
+        const clicked=rows.filter(r=>(r['Clicked']||'').toLowerCase()==='yes').length;
+        const bounced=rows.filter(r=>(r['Bounced']||'').toLowerCase()==='yes').length;
+        const notOpen=sent-opened;
+        const domains=new Set(rows.map(r=>{
+            const e=r['Email address']||r['Contact Contact Primary Email']||'';
+            return e.split('@')[1];
+        }).filter(Boolean));
+        return{sent,opened,clicked,bounced,notOpen,orgs:domains.size};
+    }
+    function pct(a,b){return b?((a/b)*100).toFixed(1)+'%':'0%';}
+    function makeRecipientRows(rows){
+        return rows.map(r=>({
+            email: r['Email address']||r['Contact Contact Primary Email']||'',
+            sent:  r['Date sent']||'',
+            read:  (r['Date read']||'').trim()!==''?'Yes':'No',
+            clicked:(r['Clicked']||'').toLowerCase()==='yes'?'Yes':'No'
+        }));
+    }
+    </script>
     <style>
         body { background-color: #12141c; color: #ffffff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         .sidebar { background-color: #1a1d26; }
@@ -110,13 +231,13 @@
         </div>
     </nav>
 
-    <!-- Upload button - fixed at bottom, always visible -->
+    <!-- Auto-refresh status - fixed at bottom, always visible -->
     <div class="p-6 pt-4 shrink-0 border-t border-gray-800">
-        <label class="w-full text-white font-semibold py-3 px-4 rounded-xl shadow-lg transition flex items-center justify-center gap-2 text-sm cursor-pointer hover:opacity-90" style="background:#e8533a;">
-            <i class="fa-solid fa-arrow-up-from-bracket"></i> Upload CSV
-            <input type="file" accept=".csv" class="hidden" onchange="handleCSVUpload(event)">
-        </label>
-        <p class="text-[10px] text-center text-gray-500 mt-2 uppercase tracking-wider" id="upload-status">Upload Report</p>
+        <button onclick="loadAllData()" class="w-full text-white font-semibold py-3 px-4 rounded-xl shadow-lg transition flex items-center justify-center gap-2 text-sm cursor-pointer hover:opacity-90" style="background:#e8533a;">
+            <i class="fa-solid fa-rotate"></i> Refresh Now
+        </button>
+        <p class="text-[10px] text-center text-gray-500 mt-2" id="lastRefreshTime">Loading...</p>
+        <p class="text-[9px] text-center text-gray-600 mt-0.5">Auto-refreshes every 2 hours</p>
     </div>
 </div>
 
@@ -180,7 +301,7 @@
                     <th class="pb-2 font-semibold text-center">Click Count</th>
                     <th class="pb-2 font-semibold text-center">Not Opened</th>
                 </tr></thead>
-                <tbody class="divide-y divide-gray-800/30">
+                <tbody class="divide-y divide-gray-800/30" id="home-cat-table">
                     <tr class="orange-text"><td class="py-1.5 font-medium">Sign Up</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center text-red-400">-</td></tr>
                     <tr class="orange-text"><td class="py-1.5 font-medium">News</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center text-red-400">-</td></tr>
                     <tr class="orange-text"><td class="py-1.5 font-medium">Chomp Show</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center text-red-400">-</td></tr>
@@ -280,7 +401,7 @@
                     <th class="pb-2 font-semibold text-center">Read Count</th>
                     <th class="pb-2 font-semibold text-center">Click Count</th>
                 </tr></thead>
-                <tbody class="divide-y divide-gray-800/30">
+                <tbody class="divide-y divide-gray-800/30" id="home-nl-table">
                     <tr class="orange-text"><td class="py-1.5 font-medium">RA News Letter Week-1</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center">-</td></tr>
                     <tr class="orange-text"><td class="py-1.5 font-medium">RA News Letter Week-2</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center">-</td></tr>
                     <tr class="orange-text"><td class="py-1.5 font-medium">RA News Letter Week-3</td><td class="text-center">-</td><td class="text-center">-</td><td class="text-center">-</td></tr>
@@ -305,7 +426,7 @@
                     <th class="pb-2 font-semibold text-center">Assigned Mautic Tag</th>
                     <th class="pb-2 font-semibold text-center">Email Sent Status</th>
                 </tr></thead>
-                <tbody class="divide-y divide-gray-800/30">
+                <tbody class="divide-y divide-gray-800/30" id="home-reg-table">
                     <tr class="hover:bg-gray-800/10 transition"><td class="py-2.5 font-medium orange-text">Sign Up</td><td class="text-center text-white font-semibold">1,240</td><td class="text-center"><span class="px-2 py-0.5 bg-gray-800 rounded text-gray-300 font-mono text-[10px]">Sign_Up</span></td><td class="text-center text-emerald-400 font-medium"><i class="fa-regular fa-circle-check mr-1"></i> 99.1% Success</td></tr>
                     <tr class="hover:bg-gray-800/10 transition"><td class="py-2.5 font-medium orange-text">Contact Us</td><td class="text-center text-white font-semibold">320</td><td class="text-center"><span class="px-2 py-0.5 bg-gray-800 rounded text-gray-300 font-mono text-[10px]">intent_contact</span></td><td class="text-center text-emerald-400 font-medium"><i class="fa-regular fa-circle-check mr-1"></i> 100% Sent</td></tr>
                     <tr class="hover:bg-gray-800/10 transition"><td class="py-2.5 font-medium orange-text">Chomp Show</td><td class="text-center text-white font-semibold">450</td><td class="text-center"><span class="px-2 py-0.5 bg-gray-800 rounded text-gray-300 font-mono text-[10px]">interest_chomp_show</span></td><td class="text-center text-emerald-400 font-medium"><i class="fa-regular fa-circle-check mr-1"></i> 98.4% Sent</td></tr>
@@ -351,8 +472,8 @@
     <div class="flex items-center gap-3 mb-5">
         <i class="fa-solid fa-fire text-[#e8533a] text-xl"></i>
         <h1 class="text-xl font-bold">Sign Up</h1>
-        <span class="text-[10px] text-gray-400 bg-gray-800/70 px-3 py-1 rounded-full">Exclusive Access: Complimentary Gold Membership with Restaurant Association</span>
-        <span class="ml-auto text-[11px] text-gray-500">June 11, 2026</span>
+        <span class="text-[10px] text-gray-400 bg-gray-800/70 px-3 py-1 rounded-full" id="su-subject">—</span>
+        <span class="ml-auto text-[11px] text-gray-500" id="su-date">—</span>
     </div>
 
     <!-- KPI Cards — 8 cards including Bounced -->
@@ -362,7 +483,7 @@
             <div class="flex justify-between items-start">
                 <div>
                     <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Emails Sent</p>
-                    <p class="text-2xl font-bold mt-1" style="color:#e8533a;">271</p>
+                    <p class="text-2xl font-bold mt-1" style="color:#e8533a;" id="su-sent">—</p>
                     <p class="text-[9px] text-gray-500 mt-0.5">Total delivered</p>
                 </div>
                 <i class="fa-solid fa-envelope text-gray-700 text-lg mt-1"></i>
@@ -372,8 +493,8 @@
             <div class="flex justify-between items-start">
                 <div>
                     <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Unique Opens</p>
-                    <p class="text-2xl font-bold mt-1 text-blue-400">163</p>
-                    <p class="text-[9px] text-gray-500 mt-0.5">Open rate: 60.1%</p>
+                    <p class="text-2xl font-bold mt-1 text-blue-400" id="su-opened">—</p>
+                    <p class="text-[9px] text-gray-500 mt-0.5" id="su-openrate-sub">Open rate: —</p>
                 </div>
                 <i class="fa-regular fa-eye text-gray-700 text-lg mt-1"></i>
             </div>
@@ -382,8 +503,8 @@
             <div class="flex justify-between items-start">
                 <div>
                     <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Unique Clicks</p>
-                    <p class="text-2xl font-bold mt-1 text-emerald-400">8</p>
-                    <p class="text-[9px] text-gray-500 mt-0.5">Click rate: 3.0%</p>
+                    <p class="text-2xl font-bold mt-1 text-emerald-400" id="su-clicked">—</p>
+                    <p class="text-[9px] text-gray-500 mt-0.5" id="su-clickrate-sub">Click rate: —</p>
                 </div>
                 <i class="fa-regular fa-hand-pointer text-gray-700 text-lg mt-1"></i>
             </div>
@@ -392,7 +513,7 @@
             <div class="flex justify-between items-start">
                 <div>
                     <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Click-to-Open</p>
-                    <p class="text-2xl font-bold mt-1 text-amber-400">4.9%</p>
+                    <p class="text-2xl font-bold mt-1 text-amber-400" id="su-cto">—</p>
                     <p class="text-[9px] text-gray-500 mt-0.5">Of openers who clicked</p>
                 </div>
                 <i class="fa-solid fa-chart-bar text-gray-700 text-lg mt-1"></i>
@@ -404,7 +525,7 @@
             <div class="flex justify-between items-start">
                 <div>
                     <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Organisations</p>
-                    <p class="text-2xl font-bold mt-1 text-purple-400">90+</p>
+                    <p class="text-2xl font-bold mt-1 text-purple-400" id="su-orgs">—</p>
                     <p class="text-[9px] text-gray-500 mt-0.5">Unique email domains</p>
                 </div>
                 <i class="fa-solid fa-building text-gray-700 text-lg mt-1"></i>
@@ -414,8 +535,8 @@
             <div class="flex justify-between items-start">
                 <div>
                     <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Not Opened</p>
-                    <p class="text-2xl font-bold mt-1 text-red-400">108</p>
-                    <p class="text-[9px] text-gray-500 mt-0.5">39.9% of sent</p>
+                    <p class="text-2xl font-bold mt-1 text-red-400" id="su-notopen">—</p>
+                    <p class="text-[9px] text-gray-500 mt-0.5" id="su-notopen-sub">— of sent</p>
                 </div>
                 <i class="fa-solid fa-xmark text-gray-700 text-lg mt-1"></i>
             </div>
@@ -424,8 +545,8 @@
             <div class="flex justify-between items-start">
                 <div>
                     <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Bounced Email</p>
-                    <p class="text-2xl font-bold mt-1 text-gray-300">0</p>
-                    <p class="text-[9px] text-gray-500 mt-0.5">0.0% bounce rate</p>
+                    <p class="text-2xl font-bold mt-1 text-gray-300" id="su-bounced">—</p>
+                    <p class="text-[9px] text-gray-500 mt-0.5" id="su-bounced-sub">— bounce rate</p>
                 </div>
                 <i class="fa-solid fa-triangle-exclamation text-gray-700 text-lg mt-1"></i>
             </div>
@@ -434,7 +555,7 @@
             <div class="flex justify-between items-start">
                 <div>
                     <p class="text-[10px] text-gray-400 font-semibold uppercase tracking-wider">Avg Open Rate</p>
-                    <p class="text-2xl font-bold mt-1 text-pink-400">60.1%</p>
+                    <p class="text-2xl font-bold mt-1 text-pink-400" id="su-openrate">—</p>
                     <p class="text-[9px] text-gray-500 mt-0.5">Read ratio avg</p>
                 </div>
                 <i class="fa-solid fa-percent text-gray-700 text-lg mt-1"></i>
@@ -449,26 +570,26 @@
         <div class="card-bg p-5 rounded-xl">
             <div class="flex items-center justify-between mb-4 pb-2 border-b border-gray-800">
                 <h3 class="text-sm font-semibold">Email Funnel</h3>
-                <span class="text-[10px] text-gray-500 truncate max-w-[200px]">Exclusive Access: Complimentary Gold Mem...</span>
+                <span class="text-[10px] text-gray-500 truncate max-w-[200px]" id="su-funnel-subject">—</span>
             </div>
             <div class="space-y-4">
                 <div>
                     <div class="flex items-center gap-3 mb-1">
-                        <div class="h-8 rounded flex items-center px-3 bg-blue-500 font-bold text-sm" style="width:100%">271</div>
+                        <div class="h-8 rounded flex items-center px-3 bg-blue-500 font-bold text-sm" id="su-funnel-sent-bar" style="width:100%">—</div>
                     </div>
                     <div class="flex justify-between text-[10px] text-gray-400 px-1"><span>Delivered</span><span>100%</span></div>
                 </div>
                 <div>
                     <div class="flex items-center gap-3 mb-1">
-                        <div class="h-8 rounded flex items-center px-3 bg-emerald-500 font-bold text-sm" style="width:60.1%">163</div>
+                        <div class="h-8 rounded flex items-center px-3 bg-emerald-500 font-bold text-sm" id="su-funnel-open-bar" style="width:0%">—</div>
                     </div>
-                    <div class="flex justify-between text-[10px] text-gray-400 px-1"><span>Opened</span><span>60.1%</span></div>
+                    <div class="flex justify-between text-[10px] text-gray-400 px-1"><span>Opened</span><span id="su-funnel-open-pct">—</span></div>
                 </div>
                 <div>
                     <div class="flex items-center gap-3 mb-1">
-                        <div class="h-8 rounded flex items-center px-3 font-bold text-sm text-white" style="width:3%; min-width:44px; background:#e8533a;">8</div>
+                        <div class="h-8 rounded flex items-center px-3 font-bold text-sm text-white" id="su-funnel-click-bar" style="width:0%; min-width:44px; background:#e8533a;">—</div>
                     </div>
-                    <div class="flex justify-between text-[10px] text-gray-400 px-1"><span>Clicked</span><span>3.0%</span></div>
+                    <div class="flex justify-between text-[10px] text-gray-400 px-1"><span>Clicked</span><span id="su-funnel-click-pct">—</span></div>
                 </div>
             </div>
         </div>
@@ -484,15 +605,15 @@
                 <div class="space-y-5 flex-1">
                     <div class="flex items-center justify-between">
                         <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-emerald-500 inline-block"></span><span class="text-sm text-gray-300">Clicked</span></div>
-                        <span class="text-sm font-bold text-white">8</span>
+                        <span class="text-sm font-bold text-white" id="su-eng-clicked">—</span>
                     </div>
                     <div class="flex items-center justify-between">
                         <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-blue-400 inline-block"></span><span class="text-sm text-gray-300">Opened, not clicked</span></div>
-                        <span class="text-sm font-bold text-white">155</span>
+                        <span class="text-sm font-bold text-white" id="su-eng-openedonly">—</span>
                     </div>
                     <div class="flex items-center justify-between">
                         <div class="flex items-center gap-2"><span class="w-3 h-3 rounded-full bg-gray-600 inline-block"></span><span class="text-sm text-gray-300">Not opened</span></div>
-                        <span class="text-sm font-bold text-white">108</span>
+                        <span class="text-sm font-bold text-white" id="su-eng-notopened">—</span>
                     </div>
                 </div>
             </div>
@@ -506,7 +627,7 @@
         <div class="card-bg p-5 rounded-xl">
             <div class="flex items-center justify-between mb-3 pb-2 border-b border-gray-800">
                 <h3 class="text-sm font-semibold">Recipient Activity</h3>
-                <span class="text-[10px] text-gray-500">271 contacts</span>
+                <span class="text-[10px] text-gray-500" id="su-contact-count">— contacts</span>
             </div>
             <div class="mb-3 flex gap-2">
                 <div class="relative flex-1">
@@ -1240,8 +1361,93 @@ function showPage(pageId, navId) {
         if(nv) nv.classList.add('active');
     }
 }
-function showHome()     { showPage('page-home', null); }
-function showSignUp()   { showPage('page-signup','nav-signup');   setTimeout(()=>{drawDonut2();renderRecipients();renderOrgs();},50); }
+function showHome()     { showPage('page-home', null); renderHome(); }
+
+function renderHome() {
+    if (!dataLoaded) return;
+    // Category summary table
+    const catNames = Object.keys(categorySubjectMap);
+    const catTbody = document.getElementById('home-cat-table');
+    if (catTbody) {
+        catTbody.innerHTML = catNames.map(name => {
+            const rows = categoryRows(name);
+            const s = rowStats(rows);
+            return `<tr class="orange-text"><td class="py-1.5 font-medium">${name}</td><td class="text-center">${s.sent||'-'}</td><td class="text-center">${s.opened||'-'}</td><td class="text-center">${s.clicked||'-'}</td><td class="text-center text-red-400">${s.notOpen||'-'}</td></tr>`;
+        }).join('');
+    }
+    // Newsletter summary table (top 8 most recent campaigns)
+    rebuildNewsletterData();
+    const nlTbody = document.getElementById('home-nl-table');
+    if (nlTbody) {
+        const top8 = nlWeeks.slice(0, 8);
+        nlTbody.innerHTML = top8.length ? top8.map(w =>
+            `<tr class="orange-text"><td class="py-1.5 font-medium" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${w.label}</td><td class="text-center">${w.sent||'-'}</td><td class="text-center">${w.read||'-'}</td><td class="text-center">${w.clicked||'-'}</td></tr>`
+        ).join('') : '<tr><td colspan="4" class="py-3 text-center text-gray-600 text-xs">No newsletter data</td></tr>';
+    }
+    // Registration/form summary table
+    const regTbody = document.getElementById('home-reg-table');
+    if (regTbody && Object.keys(regData).length) {
+        regTbody.innerHTML = Object.keys(regData).map(name => {
+            const cfg = regData[name];
+            const formSubs = gForms.filter(r => (r['Name']||'').toLowerCase().includes(name.toLowerCase().split(' ')[0].toLowerCase()));
+            const submissions = formSubs.length || 0;
+            const tag = cfg.tags[0] ? cfg.tags[0].tag : '—';
+            return `<tr class="hover:bg-gray-800/10 transition"><td class="py-2.5 font-medium orange-text">${name}</td><td class="text-center text-white font-semibold">${submissions || '-'}</td><td class="text-center"><span class="px-2 py-0.5 bg-gray-800 rounded text-gray-300 font-mono text-[10px]">${tag}</span></td><td class="text-center text-emerald-400 font-medium"><i class="fa-regular fa-circle-check mr-1"></i> Live</td></tr>`;
+        }).join('');
+    }
+}
+function showSignUp()   { showPage('page-signup','nav-signup');   setTimeout(()=>{renderSignupKPIs();drawDonut2();renderRecipients();renderOrgs();},50); }
+
+// Fills every KPI card, funnel bar, and engagement number on the Sign Up page from live csvData (tag_emails sheet)
+function renderSignupKPIs() {
+    const s = rowStats(csvData);
+    const openRate  = pct(s.opened, s.sent);
+    const clickRate = pct(s.clicked, s.sent);
+    const cto       = pct(s.clicked, s.opened);
+    const bounceRate = pct(s.bounced, s.sent);
+    const notOpenPct = pct(s.notOpen, s.sent);
+    const openedNotClicked = s.opened - s.clicked;
+
+    const subj = gTagEmails.find(r => {
+        const e = (r['Email address']||r['Contact Contact Primary Email']||'').toLowerCase();
+        return (categorySubjectMap['Sign Up']||[]).some(k => (r['Subject']||'').toLowerCase().includes(k));
+    });
+    const subjectLine = subj ? subj['Subject'] : '—';
+    const sentDate = subj ? (subj['Date sent']||'').split(' ')[0] : '—';
+
+    const set = (id, val) => { const el=document.getElementById(id); if(el) el.textContent = val; };
+    set('su-subject', subjectLine);
+    set('su-date', sentDate);
+    set('su-sent', s.sent || 0);
+    set('su-opened', s.opened || 0);
+    set('su-openrate-sub', 'Open rate: ' + openRate);
+    set('su-clicked', s.clicked || 0);
+    set('su-clickrate-sub', 'Click rate: ' + clickRate);
+    set('su-cto', cto);
+    set('su-orgs', s.orgs || 0);
+    set('su-notopen', s.notOpen || 0);
+    set('su-notopen-sub', notOpenPct + ' of sent');
+    set('su-bounced', s.bounced || 0);
+    set('su-bounced-sub', bounceRate + ' bounce rate');
+    set('su-openrate', openRate);
+    set('su-contact-count', (s.sent||0) + ' contacts');
+
+    // Funnel
+    set('su-funnel-subject', subjectLine);
+    const fSent = document.getElementById('su-funnel-sent-bar');
+    if (fSent) { fSent.style.width='100%'; fSent.textContent = s.sent || 0; }
+    const fOpen = document.getElementById('su-funnel-open-bar');
+    if (fOpen) { fOpen.style.width = (s.sent ? (s.opened/s.sent*100) : 0) + '%'; fOpen.textContent = s.opened || 0; }
+    set('su-funnel-open-pct', openRate);
+    const fClick = document.getElementById('su-funnel-click-bar');
+    if (fClick) { fClick.style.width = (s.sent ? Math.max(s.clicked/s.sent*100, s.clicked?3:0) : 0) + '%'; fClick.textContent = s.clicked || 0; }
+    set('su-funnel-click-pct', clickRate);
+
+    // Engagement breakdown
+    set('su-eng-clicked', s.clicked || 0);
+    set('su-eng-openedonly', openedNotClicked || 0);
+    set('su-eng-notopened', s.notOpen || 0);
+}
 function showNurturing(){ showPage('page-nurturing','nav-nurturing'); renderNurturing(); }
 
 // ===== UNIFIED SIDEBAR ACCORDION (only one open at a time) =====
@@ -1295,8 +1501,8 @@ function showCategory(catName) {
     // keep emailcat parent highlighted
     document.getElementById('nav-emailcat').classList.add('active');
 
-    // For now, Sign Up uses real CSV data. Others show empty state.
-    const data = catName === 'Sign Up' ? csvData : [];
+    // Real data for every category, sourced from tag_emails Google Sheet tab
+    const data = categoryRows(catName);
     const sent = data.length;
     const opened = data.filter(r=>r.read==='Yes').length;
     const clicked = data.filter(r=>r.clicked==='Yes').length;
@@ -1374,7 +1580,7 @@ function drawCatDonut(clicked, openedNot, notOpened, total) {
 function filterCatRecipients() {
     const q = document.getElementById('catSearchInput').value.toLowerCase();
     const f = document.getElementById('catFilterSel').value;
-    const base = currentCategory === 'Sign Up' ? csvData : [];
+    const base = categoryRows(currentCategory);
     catFiltered = base.filter(r => {
         const mq = r.email.toLowerCase().includes(q);
         const mf = f==='all'?true: f==='clicked'?r.clicked==='Yes': f==='opened'?r.read==='Yes': r.read==='No';
@@ -1390,7 +1596,7 @@ function renderCatTable() {
     document.getElementById('catRecipientBody').innerHTML = rows.map(r=>`
         <tr class="hover:bg-gray-800/20 transition">
             <td class="py-2 text-gray-300 font-mono" style="font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.email}</td>
-            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent.replace('June 11, 2026 ','Jun 11, ')}</td>
+            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent || '—'}</td>
             <td class="text-center">${r.read==='Yes'?'<span style="background:rgba(16,185,129,0.15);color:#34d399;border:1px solid rgba(16,185,129,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>':'<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
             <td class="text-center">${r.clicked==='Yes'?'<span style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>':'<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
         </tr>`).join('');
@@ -1400,12 +1606,65 @@ function renderCatTable() {
 function catPrevPage(){ if(catPage>1){catPage--;renderCatTable();} }
 function catNextPage(){ if(catPage<Math.ceil(catFiltered.length/catPerPage)){catPage++;renderCatTable();} }
 
-// ===== DATA =====
-const csvData = []
-
-const orgData = []
+// ===== DATA (populated from Google Sheets) =====
+let csvData = [];
+let orgData = [];
 const orgColors = ["#60a5fa","#34d399","#f87171","#fbbf24","#a78bfa","#fb923c","#4ade80","#38bdf8","#f472b6","#818cf8"];
 const hourlyData = {}
+
+// Maps "Category" / "Sign Up" page name -> keyword(s) to match in tag_emails Subject column.
+// Edit these keywords if your Mautic Subject lines use different wording.
+const categorySubjectMap = {
+    'Sign Up':     ['gold membership','exclusive access'],
+    'News':        ['news'],
+    'Chomp Show':  ['chomp show'],
+    'Academy':     ['academy'],
+    'Jobs':        ['jobs'],
+    'Resources':   ['resources'],
+    'Contact Us':  ['contact us'],
+    'Benefits':    ['benefits']
+};
+
+// Convert a raw tag_emails (or newsletter) sheet row into the {email,sent,read,clicked} shape
+// used throughout the existing render functions.
+function toRecipientRow(r) {
+    const sentRaw = r['Date sent'] || '';
+    let timeStr = sentRaw;
+    try { const d = new Date(sentRaw); if(!isNaN(d)) timeStr = d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true}); } catch(e){}
+    return {
+        email: r['Email address'] || r['Contact Contact Primary Email'] || '',
+        sent: timeStr,
+        sentRaw: sentRaw,
+        // "Date read" has a value only if the recipient actually opened the email.
+        // The "Read" column itself is always "Yes" in the source sheet, so it's not used here.
+        read: (r['Date read']||'').trim() !== '' ? 'Yes':'No',
+        clicked: (r['Clicked']||'').toLowerCase()==='yes' ? 'Yes':'No'
+    };
+}
+
+// Returns recipient rows (in csvData shape) for a given category name, sourced from tag_emails sheet.
+function categoryRows(catName) {
+    const keywords = categorySubjectMap[catName] || [catName.toLowerCase()];
+    return gTagEmails
+        .filter(r => {
+            const subj = (r['Subject']||'').toLowerCase();
+            return keywords.some(k => subj.includes(k));
+        })
+        .filter(r => r['Email address'] || r['Contact Contact Primary Email'])
+        .map(toRecipientRow);
+}
+
+function rebuildOrgData(rows) {
+    const domainCount = {};
+    rows.forEach(r => { const d=r.email.split('@')[1]; if(d) domainCount[d]=(domainCount[d]||0)+1; });
+    return Object.entries(domainCount).sort((a,b)=>b[1]-a[1]).slice(0,15);
+}
+
+// Called after Google Sheet data loads: populate csvData with the "Sign Up" category (home/signup page default)
+function rebuildCoreData() {
+    csvData = categoryRows('Sign Up');
+    orgData = rebuildOrgData(csvData);
+}
 
 // ===== RECIPIENT TABLE =====
 let currentPage = 1;
@@ -1430,7 +1689,7 @@ function renderRecipients() {
     document.getElementById('recipientBody').innerHTML = rows.map(r => `
         <tr class="hover:bg-gray-800/20 transition">
             <td class="py-2 text-gray-300 font-mono" style="font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.email}</td>
-            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent.replace('June 11, 2026 ','Jun 11, ')}</td>
+            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent || '—'}</td>
             <td class="text-center">${r.read==='Yes' ? '<span style="background:rgba(16,185,129,0.15);color:#34d399;border:1px solid rgba(16,185,129,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>' : '<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
             <td class="text-center">${r.clicked==='Yes' ? '<span style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>' : '<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
         </tr>`).join('');
@@ -1630,19 +1889,25 @@ const regNavIds = {
     'Chomp Show':'nav-reg-chomp','Benefits':'nav-reg-benefits','Jobs':'nav-reg-jobs'
 };
 
+let currentRegName = '';
 let regFiltered = [];
 let regPage = 1;
 const regPerPage = 12;
 
 function showRegistration(name) {
+    currentRegName = name;
     Object.values(regNavIds).forEach(id => { const el=document.getElementById(id); if(el) el.classList.remove('active'); });
     const el = document.getElementById(regNavIds[name]);
     if(el) el.classList.add('active');
     showPage('page-registration', null);
     document.getElementById('nav-registration').classList.add('active');
 
-    const d = regData[name] || { submissions:0, tags:[], emailSent:0 };
-    const emailData = name === 'Sign Up' ? csvData : [];
+    // Tags + base info still come from regData config (trigger labels/colors), but submissions count
+    // and email stats now come from live Google Sheets data.
+    const cfg = regData[name] || { tags:[] };
+    const formSubs = gForms.filter(r => (r['Name']||'').toLowerCase().includes(name.toLowerCase().split(' ')[0].toLowerCase()));
+    const submissions = formSubs.length || cfg.submissions || 0;
+    const emailData = categoryRows(name);
     const sent     = emailData.length;
     const opened   = emailData.filter(r=>r.read==='Yes').length;
     const clicked  = emailData.filter(r=>r.clicked==='Yes').length;
@@ -1657,9 +1922,9 @@ function showRegistration(name) {
     document.getElementById('reg-badge').textContent = name;
 
     // KPI cards
-    document.getElementById('reg-submissions').textContent = d.submissions || '—';
-    document.getElementById('reg-tags-count').textContent  = d.tags.reduce((a,t)=>a+t.tagged,0) || '—';
-    document.getElementById('reg-email-sent').textContent  = sent || d.emailSent || '—';
+    document.getElementById('reg-submissions').textContent = submissions || '—';
+    document.getElementById('reg-tags-count').textContent  = cfg.tags.reduce((a,t)=>a+t.tagged,0) || '—';
+    document.getElementById('reg-email-sent').textContent  = sent || '—';
     document.getElementById('reg-opened').textContent      = opened || '—';
     document.getElementById('reg-open-rate').textContent   = 'Open rate: ' + openRate;
     document.getElementById('reg-clicked').textContent     = clicked || '—';
@@ -1669,7 +1934,7 @@ function showRegistration(name) {
     document.getElementById('reg-cto').textContent         = cto;
 
     // Assigned Tags cards
-    document.getElementById('reg-tag-cards').innerHTML = d.tags.map(t=>`
+    document.getElementById('reg-tag-cards').innerHTML = cfg.tags.map(t=>`
         <div class="p-4 rounded-xl" style="background:#161920;border:1.5px solid ${t.color}33;">
             <p class="text-[9px] text-gray-500 uppercase tracking-wider mb-2">Tag Name</p>
             <span class="font-mono text-sm font-bold px-3 py-1 rounded-lg" style="color:${t.color};background:${t.color}18;border:1px solid ${t.color}33;">${t.tag}</span>
@@ -1701,7 +1966,8 @@ function showRegistration(name) {
 function filterRegRecipients() {
     const q=document.getElementById('regSearchInput').value.toLowerCase();
     const f=document.getElementById('regFilterSel').value;
-    regFiltered=csvData.filter(r=>{
+    const base = categoryRows(currentRegName || 'Sign Up');
+    regFiltered=base.filter(r=>{
         const mq=r.email.toLowerCase().includes(q);
         const mf=f==='all'?true:f==='clicked'?r.clicked==='Yes':f==='opened'?r.read==='Yes':r.read==='No';
         return mq&&mf;
@@ -1717,7 +1983,7 @@ function renderRegTable() {
     tbody.innerHTML=rows.map(r=>`
         <tr class="hover:bg-gray-800/20 transition">
             <td class="py-2 text-gray-300 font-mono" style="font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.email}</td>
-            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent.replace('June 11, 2026 ','Jun 11, ')}</td>
+            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent || '—'}</td>
             <td class="text-center">${r.read==='Yes'?'<span style="background:rgba(16,185,129,0.15);color:#34d399;border:1px solid rgba(16,185,129,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>':'<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
             <td class="text-center">${r.clicked==='Yes'?'<span style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>':'<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
         </tr>`).join('');
@@ -1746,12 +2012,14 @@ const eoNavIds = {
     'Contact Us':'nav-eo-contact','Benefits':'nav-eo-benefits'
 };
 
+let currentEOName='', currentEOTag='', currentEOColor='';
 let eoFiltered = [];
 let eoPage = 1;
 const eoPerPage = 12;
 let currentEOTab = 'analytics';
 
 function showEventOccur(name, tag, color) {
+    currentEOName = name; currentEOTag = tag; currentEOColor = color;
     Object.values(eoNavIds).forEach(id => { const el=document.getElementById(id); if(el) el.classList.remove('active'); });
     const navEl = document.getElementById(eoNavIds[name]);
     if(navEl) navEl.classList.add('active');
@@ -1759,7 +2027,7 @@ function showEventOccur(name, tag, color) {
     document.getElementById('nav-eventoccur').classList.add('active');
 
     const d = eoTagMap[name] || { tag: tag, event:'—', hits:0, tagged:0 };
-    const emailData = name === 'Sign Up' ? csvData : [];
+    const emailData = categoryRows(name);
     const sent     = emailData.length;
     const opened   = emailData.filter(r=>r.read==='Yes').length;
     const clicked  = emailData.filter(r=>r.clicked==='Yes').length;
@@ -1818,7 +2086,7 @@ function showEventOccur(name, tag, color) {
 function filterEORecipients() {
     const q = document.getElementById('eoSearchInput').value.toLowerCase();
     const f = document.getElementById('eoFilterSel').value;
-    eoFiltered = csvData.filter(r => {
+    eoFiltered = categoryRows(currentEOName || 'Sign Up').filter(r => {
         const mq = r.email.toLowerCase().includes(q);
         const mf = f==='all'?true: f==='clicked'?r.clicked==='Yes': f==='opened'?r.read==='Yes': r.read==='No';
         return mq && mf;
@@ -1835,7 +2103,7 @@ function renderEOTable() {
     tbody.innerHTML = rows.map(r=>`
         <tr class="hover:bg-gray-800/20 transition">
             <td class="py-2 text-gray-300 font-mono" style="font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.email}</td>
-            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent.replace('June 11, 2026 ','Jun 11, ')}</td>
+            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent || '—'}</td>
             <td class="text-center">${r.read==='Yes'?'<span style="background:rgba(16,185,129,0.15);color:#34d399;border:1px solid rgba(16,185,129,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>':'<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
             <td class="text-center">${r.clicked==='Yes'?'<span style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>':'<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
         </tr>`).join('');
@@ -1847,17 +2115,35 @@ function eoPrevPage(){ if(eoPage>1){eoPage--;renderEOTable();} }
 function eoNextPage(){ if(eoPage<Math.ceil(eoFiltered.length/eoPerPage)){eoPage++;renderEOTable();} }
 
 
-// ===== NEWSLETTER DATA =====
-const nlWeeks = [
-    { week:'Week 1', label:'RA Newsletter Week-1', sent:0, read:0, clicked:0 },
-    { week:'Week 2', label:'RA Newsletter Week-2', sent:0, read:0, clicked:0 },
-    { week:'Week 3', label:'RA Newsletter Week-3', sent:0, read:0, clicked:0 },
-    { week:'Week 4', label:'RA Newsletter Week-4', sent:0, read:0, clicked:0 },
-    { week:'Week 5', label:'RA Newsletter Week-5', sent:0, read:0, clicked:0 },
-    { week:'Week 6', label:'RA Newsletter Week-6', sent:0, read:0, clicked:0 },
-    { week:'Week 7', label:'RA Newsletter Week-7', sent:0, read:0, clicked:0 },
-    { week:'Week 8', label:'RA Newsletter Week-8', sent:0, read:0, clicked:0 },
-];
+// ===== NEWSLETTER DATA (built dynamically from 'newsletter' Google Sheet tab) =====
+// Each newsletter campaign is grouped by its Subject line (e.g. "...Weekly Newsletter | Jun 15, 2026")
+let nlWeeks = [];          // [{week,label,sent,read,clicked,rows:[...]}]
+let nlGroupsByRows = {};   // subject -> raw recipient rows (csvData shape)
+
+function rebuildNewsletterData() {
+    const groups = {}; // subject -> array of raw sheet rows
+    gNewsletter.forEach(r => {
+        const subj = r['Subject'] || 'Unknown Campaign';
+        if(!groups[subj]) groups[subj] = [];
+        groups[subj].push(r);
+    });
+    // Sort campaigns by most recent "Date sent" first
+    const subjects = Object.keys(groups).sort((a,b) => {
+        const da = new Date(groups[a][0]['Date sent']||0);
+        const db = new Date(groups[b][0]['Date sent']||0);
+        return db - da;
+    });
+    nlWeeks = subjects.map((subj, i) => {
+        const rawRows = groups[subj];
+        const rows = rawRows.map(toRecipientRow);
+        const sent = rows.length;
+        const read = rows.filter(r=>r.read==='Yes').length;
+        const clicked = rows.filter(r=>r.clicked==='Yes').length;
+        nlGroupsByRows[i] = rows;
+        return { week:'Week '+(i+1), label: subj, sent, read, clicked };
+    });
+    if(!nlWeeks.length) nlWeeks = [{week:'Week 1',label:'No newsletter data yet',sent:0,read:0,clicked:0}];
+}
 
 let nlSelectedWeek = 0;
 let nlFiltered = [];
@@ -1866,11 +2152,16 @@ const nlPerPage = 12;
 
 function showNewsletter() {
     showPage('page-newsletter', 'nav-newsletter');
+    rebuildNewsletterData();
     renderNLList();
     selectNLWeek(0);
 }
 
+function renderNewsletter() { rebuildNewsletterData(); renderNLList(); selectNLWeek(nlSelectedWeek); }
+
 function renderNLList() {
+    const wcEl = document.getElementById('nl-weeks-count');
+    if(wcEl) wcEl.textContent = nlWeeks.length + (nlWeeks.length===1?' Campaign':' Campaigns');
     const container = document.getElementById('nl-list');
     container.innerHTML = nlWeeks.map((w, i) => {
         const openRate  = w.sent ? (w.read/w.sent*100).toFixed(1)+'%' : '—';
@@ -1929,8 +2220,8 @@ function selectNLWeek(i) {
     document.getElementById('nl-eg-notopened').textContent = notOpen || '—';
     drawNLDonut(w.clicked, openedNotClicked, notOpen, w.sent);
 
-    // Recipients — for now Sign Up CSV as placeholder; real data comes from CSV upload
-    const emailData = i === 0 ? csvData : [];
+    // Recipients for the selected newsletter week, sourced from the Google Sheet
+    const emailData = nlGroupsByRows[i] || [];
     // Sort: Clicked first, then Opened, then Not Opened
     const sorted = [...emailData].sort((a,b) => {
         const score = r => r.clicked==='Yes' ? 2 : r.read==='Yes' ? 1 : 0;
@@ -1975,7 +2266,7 @@ function drawNLDonut(clicked, openedNot, notOpened, total) {
 function filterNLRecipients() {
     const q=document.getElementById('nlSearchInput').value.toLowerCase();
     const f=document.getElementById('nlFilterSel').value;
-    const base = nlSelectedWeek===0 ? csvData : [];
+    const base = nlGroupsByRows[nlSelectedWeek] || [];
     const sorted = [...base].sort((a,b)=>{
         const score=r=>r.clicked==='Yes'?2:r.read==='Yes'?1:0;
         return score(b)-score(a);
@@ -1996,7 +2287,7 @@ function renderNLTable() {
     tbody.innerHTML = rows.length ? rows.map(r=>`
         <tr class="hover:bg-gray-800/20 transition">
             <td class="py-2 text-gray-300 font-mono" style="font-size:10px;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${r.email}</td>
-            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent.replace('June 11, 2026 ','Jun 11, ')}</td>
+            <td class="text-center text-gray-500" style="font-size:10px;white-space:nowrap;">${r.sent || '—'}</td>
             <td class="text-center">${r.read==='Yes'?'<span style="background:rgba(16,185,129,0.15);color:#34d399;border:1px solid rgba(16,185,129,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>':'<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
             <td class="text-center">${r.clicked==='Yes'?'<span style="background:rgba(139,92,246,0.15);color:#a78bfa;border:1px solid rgba(139,92,246,0.3);font-size:10px;padding:1px 8px;border-radius:999px;font-weight:600;">Yes</span>':'<span style="background:rgba(75,85,99,0.3);color:#6b7280;font-size:10px;padding:1px 8px;border-radius:999px;">No</span>'}</td>
         </tr>`).join('') :
@@ -2008,78 +2299,12 @@ function renderNLTable() {
 function nlPrevPage(){ if(nlPage>1){nlPage--;renderNLTable();} }
 function nlNextPage(){ if(nlPage<Math.ceil(nlFiltered.length/nlPerPage)){nlPage++;renderNLTable();} }
 
-// ===== CSV UPLOAD & PARSE =====
-function handleCSVUpload(event) {
-    const file = event.target.files[0];
-    if (!file) return;
-    const status = document.getElementById('upload-status');
-    status.textContent = 'Reading...';
-    const reader = new FileReader();
-    reader.onload = function(e) {
-        try {
-            parseCSV(e.target.result, file.name);
-            status.textContent = '✓ ' + file.name;
-            status.style.color = '#34d399';
-        } catch(err) {
-            status.textContent = '✗ Error reading CSV';
-            status.style.color = '#f87171';
-            console.error(err);
-        }
-    };
-    reader.readAsText(file);
-}
-
-function parseCSV(text, filename) {
-    const lines = text.trim().split('\n');
-    const headers = lines[0].split(',').map(h => h.trim().replace(/"/g,'').toLowerCase());
-
-    const emailIdx  = headers.findIndex(h => h.includes('email'));
-    const sentIdx   = headers.findIndex(h => h.includes('date') || h.includes('sent'));
-    const readIdx   = headers.findIndex(h => h.includes('read') || h.includes('open'));
-    const clickIdx  = headers.findIndex(h => h.includes('click'));
-
-    // Clear and refill csvData
-    csvData.length = 0;
-    for (let i = 1; i < lines.length; i++) {
-        const cols = lines[i].split(',').map(c => c.trim().replace(/^"|"$/g,''));
-        if (!cols[emailIdx]) continue;
-        const sentRaw = cols[sentIdx] || '';
-        let timeStr = sentRaw;
-        try {
-            const d = new Date(sentRaw);
-            if (!isNaN(d)) timeStr = d.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',hour12:true});
-        } catch(e) {}
-
-        csvData.push({
-            email:   cols[emailIdx] || '',
-            sent:    timeStr,
-            read:    (cols[readIdx]  || '').toLowerCase() === 'yes' ? 'Yes' : 'No',
-            clicked: (cols[clickIdx] || '').toLowerCase() === 'yes' ? 'Yes' : 'No'
-        });
-    }
-
-    // Rebuild orgData
-    const domainCount = {};
-    csvData.forEach(r => {
-        const domain = r.email.split('@')[1];
-        if(domain) domainCount[domain] = (domainCount[domain]||0)+1;
-    });
-    orgData.length = 0;
-    Object.entries(domainCount).sort((a,b)=>b[1]-a[1]).slice(0,15).forEach(e=>orgData.push(e));
-
-    // Refresh current page
-    const activePage = document.querySelector('[id^="page-"].visible');
-    if(activePage){
-        const pid = activePage.id;
-        if(pid==='page-signup')   { renderRecipients(); renderOrgs(); drawDonut2(); }
-        if(pid==='page-category' && currentCategory) showCategory(currentCategory);
-        if(pid==='page-newsletter') selectNLWeek(nlSelectedWeek);
-    }
-    console.log('CSV loaded:', csvData.length, 'rows');
-}
-
-// ===== INIT =====
-window.addEventListener('load', () => { showHome(); });
+// ===== INIT: load from Google Sheets, then auto-refresh every 2 hours =====
+window.addEventListener('load', () => {
+    showHome();
+    loadAllData();
+    setInterval(loadAllData, REFRESH_MS);
+});
 </script>
 
 <!-- ===== NEWSLETTER PAGE ===== -->
@@ -2104,7 +2329,7 @@ window.addEventListener('load', () => { showHome(); });
                 <h3 class="text-sm font-semibold flex items-center gap-2">
                     <i class="fa-solid fa-list text-gray-400 text-xs"></i> Newsletter Campaigns
                 </h3>
-                <span class="text-[10px] text-gray-500">8 Weeks</span>
+                <span class="text-[10px] text-gray-500" id="nl-weeks-count">8 Weeks</span>
             </div>
             <div class="space-y-1" id="nl-list">
                 <!-- filled by JS -->
