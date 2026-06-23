@@ -2836,15 +2836,30 @@ const REPORT_MAP = [
     { id: 10, type: 'forms',      label: 'Form Submissions' }
 ];
 
+// The API returns raw DB-style field names (e_name, sent_count, unique_hits, ...)
+// but every parseXxxCSV() function below was written against the OLD human-readable
+// CSV export headers ("Name", "Sent Count", "Unique Clicks", ...). Without this
+// mapping the parsers find no matching header, silently parse 0 rows, and the
+// dashboard shows "-" / "No data yet" even though the API call itself succeeded.
+const REPORT_FIELD_LABELS = {
+    10: { f_name: 'Name' },
+    12: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', unique_hits: 'Unique Clicks', bounced: 'Bounced', unsubscribed: 'Unsubscribed' },
+    13: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', read_ratio: 'Read Ratio', unique_hits: 'Unique Clicks', unique_ratio: 'Clicks Ratio', bounced: 'Bounced', bounced_ratio: 'Bounced Ratio' },
+    14: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', unique_hits: 'Unique Clicks', bounced: 'Bounced', unsubscribed: 'Unsubscribed' },
+    15: { e_name: 'Name', email: 'Contact Contact Primary Email', date_sent: 'Date Sent' }
+};
+
 // Convert Mautic API JSON response to CSV text so existing parsers can handle it.
 // The API returns { data: [ {col1: val, col2: val, ...}, ... ], headers: [...] }
-function apiJsonToCsv(json) {
+function apiJsonToCsv(json, reportId) {
     if (!json || !json.data) return '';
     const rows = json.data;
     if (!rows.length) return '';
-    // Use the keys from the first row as headers
+    // Use the keys from the first row as headers, translated to the legacy
+    // label the parsers expect (falls back to the raw key if unmapped).
+    const labelMap = REPORT_FIELD_LABELS[reportId] || {};
     const keys = Object.keys(rows[0]);
-    const headerRow = keys.join(',');
+    const headerRow = keys.map(k => labelMap[k] || k).join(',');
     const dataRows = rows.map(row =>
         keys.map(k => {
             const val = (row[k] == null ? '' : String(row[k]));
@@ -2889,7 +2904,7 @@ async function fetchSingleReport(baseUrl, reportId, dateFrom, dateTo) {
             method: 'GET',
             headers: {
                 'Content-Type': 'application/json',
-                'Authorization': 'Basic cm5hcmF5YW5AYWx0YW1ldHJpY3MuY29tOnJuYXJheWFuQGFsdGFtZXRyaWNzLmNvbQ=='
+                'Authorization': '*******************************'
             }
         });
 
@@ -2955,7 +2970,7 @@ async function fetchAllReports() {
         fill.style.width = ((i / REPORT_MAP.length) * 90) + '%';
         try {
             const json = await fetchSingleReport(baseUrl, id, dateFrom, dateTo);
-            const csvText = apiJsonToCsv(json);
+            const csvText = apiJsonToCsv(json, id);
             // Feed into the correct parser (same as CSV upload path)
             switch (type) {
                 case 'engagement': parseEngagementCSV(csvText); break;
