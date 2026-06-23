@@ -2899,15 +2899,30 @@ const REPORT_MAP = [
     { id: 10, type: 'forms',      label: 'Form Submissions' }
 ];
 
+// The API returns raw DB-style field names (e_name, sent_count, unique_hits, ...)
+// but every parseXxxCSV() function was written against the OLD human-readable
+// CSV export headers ("Name", "Sent Count", "Unique Clicks", ...). Without this
+// mapping the parsers find no matching header, silently parse 0 rows, and the
+// dashboard shows "-" / "No data yet" even though the API call itself succeeded.
+const REPORT_FIELD_LABELS = {
+    10: { f_name: 'Name' },
+    12: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', unique_hits: 'Unique Clicks', bounced: 'Bounced', unsubscribed: 'Unsubscribed' },
+    13: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', read_ratio: 'Read Ratio', unique_hits: 'Unique Clicks', unique_ratio: 'Clicks Ratio', bounced: 'Bounced', bounced_ratio: 'Bounced Ratio' },
+    14: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', unique_hits: 'Unique Clicks', bounced: 'Bounced', unsubscribed: 'Unsubscribed' },
+    15: { e_name: 'Name', email: 'Contact Contact Primary Email', date_sent: 'Date Sent' }
+};
+
 // Convert Mautic API JSON response to CSV text so existing parsers can handle it.
 // The API returns { data: [ {col1: val, col2: val, ...}, ... ], headers: [...] }
-function apiJsonToCsv(json) {
+function apiJsonToCsv(json, reportId) {
     if (!json || !json.data) return '';
     const rows = json.data;
     if (!rows.length) return '';
-    // Use the keys from the first row as headers
+    // Use the keys from the first row as headers, translated to the legacy
+    // label the parsers expect (falls back to the raw key if unmapped).
+    const labelMap = REPORT_FIELD_LABELS[reportId] || {};
     const keys = Object.keys(rows[0]);
-    const headerRow = keys.join(',');
+    const headerRow = keys.map(k => labelMap[k] || k).join(',');
     const dataRows = rows.map(row =>
         keys.map(k => {
             const val = (row[k] == null ? '' : String(row[k]));
@@ -2972,12 +2987,36 @@ async function fetchSingleReport(baseUrl, reportId, dateFrom, dateTo) {
         // the same single row forever, stop instead of looping infinitely.
         if (rows.length === 0) break;
         start += rows.length;
+
+        // Small pause between pages so we don't hammer Mautic with dozens of
+        // requests back-to-back — some Mautic instances rate-limit/401 a client
+        // that fires 20+ requests in under a second, which looked like
+        // "sometimes data loads, sometimes it doesn't".
+        if (start < totalResults) await new Promise(r => setTimeout(r, 200));
     }
 
     // Return a json-shaped object with the merged rows, preserving any other
     // top-level keys from the first page (dataColumns, report, etc.) in case
     // they're useful elsewhere.
     return Object.assign({}, firstPageJson, { data: allRows, totalResults: allRows.length });
+}
+
+// Wraps fetchSingleReport with retries (with backoff) so a single transient
+// network hiccup or rate-limit response doesn't blank out an entire report.
+async function fetchSingleReportWithRetry(baseUrl, reportId, dateFrom, dateTo, maxAttempts = 3) {
+    let lastErr;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await fetchSingleReport(baseUrl, reportId, dateFrom, dateTo);
+        } catch (err) {
+            lastErr = err;
+            console.warn(`Report ${reportId} attempt ${attempt}/${maxAttempts} failed:`, err.message);
+            if (attempt < maxAttempts) {
+                await new Promise(r => setTimeout(r, 800 * attempt)); // 800ms, 1600ms backoff
+            }
+        }
+    }
+    throw lastErr;
 }
 
 async function fetchAllReports() {
@@ -3017,8 +3056,8 @@ async function fetchAllReports() {
         progText.textContent = `Fetching ${label}... (${i+1}/${REPORT_MAP.length})`;
         fill.style.width = ((i / REPORT_MAP.length) * 90) + '%';
         try {
-            const json = await fetchSingleReport(baseUrl, id, dateFrom, dateTo);
-            const csvText = apiJsonToCsv(json);
+            const json = await fetchSingleReportWithRetry(baseUrl, id, dateFrom, dateTo);
+            const csvText = apiJsonToCsv(json, id);
             // Feed into the correct parser (same as CSV upload path)
             switch (type) {
                 case 'engagement': parseEngagementCSV(csvText); break;
