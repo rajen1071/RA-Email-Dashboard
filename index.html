@@ -310,7 +310,7 @@
     </div>
 
     <!-- Row: Recipient Activity + Top Organisations (Sign Up recipients, from the master Recipients CSV) -->
-    <div class="grid gap-4 mb-4" style="grid-template-columns:3fr 2fr;">
+    <div class="grid gap-4 mb-4" style="grid-template-columns:3fr 2fr; margin-top:30px;">
 
         <!-- Recipient Activity -->
         <div class="card-bg p-5 rounded-xl">
@@ -2869,22 +2869,52 @@ function apiJsonToCsv(json) {
 //     }
 //     return await resp.json();
 // }
+// Mautic's report API defaults to returning only ONE row per request
+// (see "limit": 1 in the raw response) even though "totalResults" reflects
+// the true count. We must paginate using &limit=&start= until every row
+// has been collected, then merge all pages into a single { data: [...] }
+// object so the rest of the pipeline (apiJsonToCsv + parsers) is unchanged.
+const API_PAGE_SIZE = 1000; // rows per request; raise/lower if the server has its own cap
+
 async function fetchSingleReport(baseUrl, reportId, dateFrom, dateTo) {
-    const url = `${baseUrl}/api/reports/${reportId}?dateFrom=${dateFrom}&dateTo=${dateTo}`;
+    let start = 0;
+    let allRows = [];
+    let totalResults = Infinity;
+    let firstPageJson = null;
 
-    const resp = await fetch(url, {
-        method: 'GET',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Basic cm5hcmF5YW5AYWx0YW1ldHJpY3MuY29tOnJuYXJheWFuQGFsdGFtZXRyaWNzLmNvbQ=='
+    while (start < totalResults) {
+        const url = `${baseUrl}/api/reports/${reportId}?dateFrom=${dateFrom}&dateTo=${dateTo}&limit=${API_PAGE_SIZE}&start=${start}`;
+
+        const resp = await fetch(url, {
+            method: 'GET',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Basic cm5hcmF5YW5AYWx0YW1ldHJpY3MuY29tOnJuYXJheWFuQGFsdGFtZXRyaWNzLmNvbQ=='
+            }
+        });
+
+        if (!resp.ok) {
+            throw new Error(`HTTP ${resp.status} for report ${reportId}`);
         }
-    });
 
-    if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status} for report ${reportId}`);
+        const json = await resp.json();
+        if (!firstPageJson) firstPageJson = json;
+
+        const rows = (json && json.data) ? json.data : [];
+        allRows = allRows.concat(rows);
+
+        totalResults = (json && typeof json.totalResults === 'number') ? json.totalResults : allRows.length;
+
+        // Safety valve: if the server ignores limit/start and keeps returning
+        // the same single row forever, stop instead of looping infinitely.
+        if (rows.length === 0) break;
+        start += rows.length;
     }
 
-    return await resp.json();
+    // Return a json-shaped object with the merged rows, preserving any other
+    // top-level keys from the first page (dataColumns, report, etc.) in case
+    // they're useful elsewhere.
+    return Object.assign({}, firstPageJson, { data: allRows, totalResults: allRows.length });
 }
 
 async function fetchAllReports() {
