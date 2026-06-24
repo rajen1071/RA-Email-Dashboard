@@ -1648,6 +1648,15 @@ function parseRecipientsCSV(text) {
     const nameIdx  = headers.indexOf('name');
     const emailIdx = headers.indexOf('contact contact primary email');
     const sentIdx  = headers.indexOf('date sent');
+    // These are only present once the Mautic report (ID 15) is configured to
+    // include the "Is read" and "Is hit"/"Hits" columns. Until then these are
+    // -1 and every row's read/clicked simply falls back to 'No' below.
+    const readIdx    = headers.indexOf('read');
+    const clickedIdx = headers.indexOf('clicked');
+
+    // Mautic returns these as 0/1 (or blank) — normalize to the 'Yes'/'No'
+    // strings the rest of the UI (badges, filters) already expects.
+    const toYesNo = v => (v === '1' || v === '1.0' || /^true$/i.test(v || '')) ? 'Yes' : 'No';
 
     const nameToCategory = {};
     Object.keys(categoryToEngagementName).forEach(cat => {
@@ -1662,17 +1671,22 @@ function parseRecipientsCSV(text) {
         const email = (cols[emailIdx] || '').trim();
         if (!rawName || !email) continue;
         const sent = (cols[sentIdx] || '').trim();
+        // null (not 'No') when the column genuinely isn't in the API response —
+        // report 15 doesn't currently expose is_read/is_hit, so until a Mautic
+        // admin adds those columns, these stay unknown rather than falsely 'No'.
+        const read = readIdx > -1 ? toYesNo((cols[readIdx] || '').trim()) : null;
+        const clicked = clickedIdx > -1 ? toYesNo((cols[clickedIdx] || '').trim()) : null;
 
         const category = nameToCategory[rawName];
         if (category) {
             if (!groupedCat[category]) groupedCat[category] = [];
-            groupedCat[category].push({ email, sent });
+            groupedCat[category].push({ email, sent, read, clicked });
             continue;
         }
         // Not a known category — check if it's a newsletter campaign row instead.
         if (/newsletter/i.test(rawName)) {
             if (!groupedNL[rawName]) groupedNL[rawName] = [];
-            groupedNL[rawName].push({ email, sent });
+            groupedNL[rawName].push({ email, sent, read, clicked });
         }
         // Otherwise unrecognized — skip.
     }
@@ -2909,7 +2923,7 @@ const REPORT_FIELD_LABELS = {
     12: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', unique_hits: 'Unique Clicks', bounced: 'Bounced', unsubscribed: 'Unsubscribed' },
     13: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', read_ratio: 'Read Ratio', unique_hits: 'Unique Clicks', unique_ratio: 'Clicks Ratio', bounced: 'Bounced', bounced_ratio: 'Bounced Ratio' },
     14: { e_name: 'Name', sent_count: 'Sent Count', read_count: 'Read Count', unique_hits: 'Unique Clicks', bounced: 'Bounced', unsubscribed: 'Unsubscribed' },
-    15: { e_name: 'Name', email: 'Contact Contact Primary Email', date_sent: 'Date Sent' }
+    15: { e_name: 'Name', email: 'Contact Contact Primary Email', date_sent: 'Date Sent', is_read: 'Read', is_hit: 'Clicked', hits: 'Clicked' }
 };
 
 // Convert Mautic API JSON response to CSV text so existing parsers can handle it.
