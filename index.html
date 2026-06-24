@@ -3073,17 +3073,30 @@ async function fetchAllReports() {
         }
     }
 
-    // Re-render all pages with fresh data
+    // Persist immediately — the data is correct and complete at this point.
+    // Doing this BEFORE render means even if rendering throws on some edge
+    // case in a huge dataset, the fetched data is not lost; refreshing the
+    // page will reload it from storage and try rendering again.
+    saveAppDataToStorage();
+
+    // Let the browser repaint (progress bar, "Rendering..." text) before we
+    // run a big synchronous render pass on a large dataset — without this,
+    // the UI can appear frozen/unchanged until the whole render finishes.
     fill.style.width = '100%';
     progText.textContent = 'Rendering...';
-    renderHome();
-    renderNLList();
-    if (nlWeeks.length) selectNLWeek(0);
-    renderNurturing();
-    refreshCurrentPageAfterUpload();
+    await new Promise(resolve => setTimeout(resolve, 0));
 
-    // Persist this fetch so a browser refresh doesn't lose it
-    saveAppDataToStorage();
+    let renderError = null;
+    try {
+        renderHome();
+        renderNLList();
+        if (nlWeeks.length) selectNLWeek(0);
+        renderNurturing();
+        refreshCurrentPageAfterUpload();
+    } catch (err) {
+        console.error('Render error after fetching reports:', err);
+        renderError = err;
+    }
 
     // Reset UI
     btn.disabled = false;
@@ -3093,7 +3106,10 @@ async function fetchAllReports() {
 
     const okCount   = results.filter(r => r.ok).length;
     const failCount = results.length - okCount;
-    if (failCount === 0) {
+    if (renderError) {
+        status.textContent = `⚠ Data fetched (${okCount} reports) but display failed: ${renderError.message}. Try refreshing the page.`;
+        status.style.color = '#fbbf24';
+    } else if (failCount === 0) {
         status.textContent = `✓ All ${okCount} reports loaded — ${new Date().toLocaleTimeString()}`;
         status.style.color = '#34d399';
     } else if (okCount === 0) {
